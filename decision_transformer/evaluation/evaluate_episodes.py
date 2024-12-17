@@ -78,6 +78,7 @@ def evaluate_episode_rtg(
         device='cuda',
         target_return=None,
         mode='normal',
+        noise_action=True,
     ):
 
     model.eval()
@@ -103,16 +104,28 @@ def evaluate_episode_rtg(
     episode_return, episode_length = 0, 0
     with torch.no_grad():
         for t in range(max_ep_len):
-            action, return_preds = model.get_action_rtg(
-            # action = model.get_action(
-                critic,
-                (states.to(dtype=torch.float32) - state_mean) / state_std,
-                torch.cat(actions, dim=0).to(dtype=torch.float32),
-                torch.cat(rewards, dim=1).to(dtype=torch.float32),
-                torch.cat(returns_to_go, dim=1).to(dtype=torch.float32),
-                # return_to_go.to(dtype=torch.float32),
-                timesteps.to(dtype=torch.long),
-            )
+            if noise_action:
+                action, return_preds = model.get_noise_action(
+                    # action = model.get_action(
+                    critic,
+                    (states.to(dtype=torch.float32) - state_mean) / state_std,
+                    torch.cat(actions, dim=0).to(dtype=torch.float32),
+                    torch.cat(rewards, dim=1).to(dtype=torch.float32),
+                    torch.cat(returns_to_go, dim=1).to(dtype=torch.float32),
+                    # return_to_go.to(dtype=torch.float32),
+                    timesteps.to(dtype=torch.long),
+                )
+            else:
+                action, return_preds = model.get_rtg_action(
+                # action = model.get_action(
+                    critic,
+                    (states.to(dtype=torch.float32) - state_mean) / state_std,
+                    torch.cat(actions, dim=0).to(dtype=torch.float32),
+                    torch.cat(rewards, dim=1).to(dtype=torch.float32),
+                    torch.cat(returns_to_go, dim=1).to(dtype=torch.float32),
+                    # return_to_go.to(dtype=torch.float32),
+                    timesteps.to(dtype=torch.long),
+                )
 
             action = action.detach().cpu().numpy().flatten()
             state, reward, done, _ = env.step(action)

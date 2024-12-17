@@ -336,6 +336,7 @@ def experiment(
                         state_mean=state_mean,
                         state_std=state_std,
                         device=device,
+                        noise_action=variant['noise_action']
                     )
                 returns.append(ret)
                 lengths.append(length)
@@ -478,7 +479,8 @@ if __name__ == '__main__':
     parser.add_argument("--test_scale", type=float, default=None)
     parser.add_argument("--rtg_no_q", action='store_true', default=False)
     parser.add_argument("--infer_no_q", action='store_true', default=False)
-    
+    parser.add_argument("--noise_action", action='store_true', default=True)
+
     args = parser.parse_args()
 
     experiment(args.exp_name, variant=vars(args))

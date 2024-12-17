@@ -1,27 +1,27 @@
 #!/bin/bash
 
-python experiment.py --seed 123  --env halfcheetah --dataset expert --eta 1.0 --grad_norm 15.0 --exp_name qt --save_path ./save/  \
+python experiment.py --seed 124  --env halfcheetah --dataset expert --eta 1.0 --grad_norm 15.0 --exp_name qt --save_path ./save/  \
     --max_iters 500   --num_steps_per_iter 2000 --lr_decay --early_stop  --k_rewards --use_discount --q_percent 0.02
 
-python experiment.py --seed 123  --env hopper --dataset expert  --eta 1.0 --grad_norm 9.0 --exp_name qt --save_path ./save/ \
+python experiment.py --seed 124  --env hopper --dataset expert  --eta 1.0 --grad_norm 9.0 --exp_name qt --save_path ./save/ \
    --max_iters 500  --num_steps_per_iter 2000 --lr_decay --early_stop --k_rewards --use_discount   --q_percent  0.02
 
-python experiment.py --seed 123 --env walker2d --dataset expert --eta 1.0 --grad_norm 5.0 --exp_name qt --save_path ./save/ \
+python experiment.py --seed 124 --env walker2d --dataset expert --eta 1.0 --grad_norm 5.0 --exp_name qt --save_path ./save/ \
   --max_iters 500  --num_steps_per_iter 2000 --lr_decay --early_stop --k_rewards --use_discount   --q_percent  0.02
 
-python experiment.py --seed 123 --env halfcheetah --dataset medium --eta 1.0 --grad_norm 15.0 --exp_name qt --save_path ./save/  \
+python experiment.py --seed 124 --env halfcheetah --dataset medium --eta 1.0 --grad_norm 15.0 --exp_name qt --save_path ./save/  \
     --max_iters 500  --num_steps_per_iter 2000 --lr_decay --early_stop --k_rewards --use_discount  --q_percent 0.05 --K 5
 
-python experiment.py --seed 123 --env hopper --dataset medium --eta 1.0 --grad_norm 9.0 --exp_name qt --save_path ./save/  \
+python experiment.py --seed 124 --env hopper --dataset medium --eta 1.0 --grad_norm 9.0 --exp_name qt --save_path ./save/  \
     --max_iters 500  --num_steps_per_iter 2000 --lr_decay --early_stop --k_rewards --use_discount  --q_percent 0.05
 
-python experiment.py --seed 123 --env walker2d --dataset medium --eta 1.0 --grad_norm 5.0 --exp_name qt --save_path ./save/    \
+python experiment.py --seed 124 --env walker2d --dataset medium --eta 1.0 --grad_norm 5.0 --exp_name qt --save_path ./save/    \
     --max_iters 500 --num_steps_per_iter 2000 --lr_decay --early_stop --k_rewards --use_discount  --q_percent 0.05
 
-python experiment.py --seed 123 --env halfcheetah --dataset medium-replay  --eta 1.0 --grad_norm 15.0  --exp_name qt --save_path ./save/    \
+python experiment.py --seed 124 --env halfcheetah --dataset medium-replay  --eta 1.0 --grad_norm 15.0  --exp_name qt --save_path ./save/    \
     --max_iters 500 --num_steps_per_iter 2000 --lr_decay --early_stop --k_rewards --use_discount  --q_percent 0.05 --K 5
 
-python experiment.py --seed 123 --env hopper --dataset medium-replay  --eta 1.0 --grad_norm 9.0 --exp_name qt --save_path ./save/    \
+python experiment.py --seed 124 --env hopper --dataset medium-replay  --eta 1.0 --grad_norm 9.0 --exp_name qt --save_path ./save/    \
     --max_iters 500 --num_steps_per_iter 2000 --lr_decay --early_stop --k_rewards --use_discount  --q_percent 0.05
 
 python experiment.py --seed 123 --env walker2d --dataset medium-replay --eta 1.0 --grad_norm 5.0 --exp_name qt --save_path ./save/    \
