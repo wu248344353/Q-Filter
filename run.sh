@@ -89,12 +89,7 @@ python experiment.py --seed 123 \
     --max_iters 500 --num_steps_per_iter 1000 --lr_decay \
     --early_stop --k_rewards --use_discount  --early_epoch 50 \
 
-python experiment.py --seed 123 \
-    --env maze2d --dataset umaze   \
-    --eta 5.0 --grad_norm 20.0 \
-    --exp_name qt --save_path ./save/    \
-    --max_iters 100 --num_steps_per_iter 1000 --lr_decay \
-    --early_stop --k_rewards --use_discount  --early_epoch 50 \
+python experiment.py --seed 123     --env maze2d --dataset umaze       --eta 8.0 --grad_norm 20.0     --exp_name qt --save_path ./save/        --max_iters 100 --num_steps_per_iter 1000 --lr_decay     --early_stop --k_rewards --use_discount  --early_epoch 50  \
 
 python experiment.py --seed 123 \
     --env maze2d --dataset umaze-dense   \
