@@ -71,6 +71,7 @@ def evaluate_episode_rtg(
         act_dim,
         model,
         critic,
+        rewardToGo,
         max_ep_len=2000,
         scale=1000.,
         state_mean=0.,
@@ -82,7 +83,11 @@ def evaluate_episode_rtg(
     ):
 
     model.eval()
+    critic.eval()
+    rewardToGo.eval()
     model.to(device=device)
+    critic.to(device=device)
+    rewardToGo.to(device=device)
 
     state_mean = torch.from_numpy(state_mean).to(device=device)
     state_std = torch.from_numpy(state_std).to(device=device)
@@ -97,7 +102,7 @@ def evaluate_episode_rtg(
     actions = [torch.zeros((1, act_dim), device=device, dtype=torch.float32)]
     timesteps = torch.tensor(0, device=device, dtype=torch.long).reshape(1, 1)
     rewards = [torch.zeros((1, 1), device=device, dtype=torch.float32)]
-    returns_to_go =  [torch.zeros((1, 1), device=device, dtype=torch.float32)]
+    returns_to_go = [torch.zeros((1, 1), device=device, dtype=torch.float32)]
 
     sim_states = []
 
@@ -108,6 +113,7 @@ def evaluate_episode_rtg(
                 action, return_preds = model.get_noise_action(
                     # action = model.get_action(
                     critic,
+                    rewardToGo,
                     (states.to(dtype=torch.float32) - state_mean) / state_std,
                     torch.cat(actions, dim=0).to(dtype=torch.float32),
                     torch.cat(rewards, dim=1).to(dtype=torch.float32),
@@ -119,6 +125,7 @@ def evaluate_episode_rtg(
                 action, return_preds = model.get_rtg_action(
                 # action = model.get_action(
                     critic,
+                    rewardToGo
                     (states.to(dtype=torch.float32) - state_mean) / state_std,
                     torch.cat(actions, dim=0).to(dtype=torch.float32),
                     torch.cat(rewards, dim=1).to(dtype=torch.float32),

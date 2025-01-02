@@ -33,6 +33,7 @@ class Trainer:
     def __init__(self,
                  model,
                  critic,
+                 rewardToGo,
                  batch_size,
                  tau,
                  discount,
@@ -61,6 +62,8 @@ class Trainer:
 
         self.actor = model
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr, weight_decay=weight_decay)
+        self.rewardToGo = rewardToGo
+        self.rtg_optimizer = torch.optim.Adam(self.rewardToGo.parameters(), lr=lr)
 
         self.step_start_ema = step_start_ema
         self.ema = EMA(ema_decay)
@@ -74,6 +77,7 @@ class Trainer:
         if lr_decay:
             self.actor_lr_scheduler = CosineAnnealingLR(self.actor_optimizer, T_max=lr_maxt, eta_min=lr_min)
             self.critic_lr_scheduler = CosineAnnealingLR(self.critic_optimizer, T_max=lr_maxt, eta_min=lr_min)
+            self.rewardToGo_lr_scheduler = CosineAnnealingLR(self.rtg_optimizer, T_max=lr_maxt, eta_min=lr_min)
 
         self.batch_size = batch_size
         self.get_batch = get_batch
@@ -96,6 +100,8 @@ class Trainer:
 
         self.start_time = time.time()
         self.step = 0
+        # self.train_a = True
+        self.max_length = self.actor.max_length
 
     def step_ema(self):
         if self.step > self.step_start_ema and self.step % self.update_ema_every == 0:
@@ -109,6 +115,7 @@ class Trainer:
 
         self.actor.train()
         self.critic.train()
+        self.rewardToGo.train()
         loss_metric = {
             'bc_loss': [],
             'ql_loss': [],
@@ -123,6 +130,7 @@ class Trainer:
         if self.lr_decay:
             self.actor_lr_scheduler.step()
             self.critic_lr_scheduler.step()
+            self.rewardToGo_lr_scheduler.step()
 
         logger.record_tabular('BC Loss', np.mean(loss_metric['bc_loss']))
         logger.record_tabular('QL Loss', np.mean(loss_metric['ql_loss']))
@@ -138,8 +146,9 @@ class Trainer:
 
         self.actor.eval()
         self.critic.eval()
+        self.rewardToGo.eval()
         for eval_fn in self.eval_fns:
-            outputs = eval_fn(self.actor, self.critic_target)
+            outputs = eval_fn(self.actor, self.critic_target, self.rewardToGo)
             for k, v in outputs.items():
                 logs[f'evaluation/{k}'] = v
 
@@ -182,6 +191,20 @@ class Trainer:
         action_dim = actions.shape[-1]
         device = states.device
 
+        '''RTG Training'''
+        rtg_predict = self.rewardToGo(states, timesteps)
+        rtg_preds = rtg_predict.reshape(-1, 1)[attention_mask.reshape(-1) > 0]
+        rtg_target = rtg[:, :-1].reshape(-1, 1)[attention_mask.reshape(-1) > 0]
+        # norm = rtg_target.abs().mean()
+        # u = (rtg_target - rtg_preds) / norm
+        u = rtg_target - rtg_preds
+        rtg_loss = torch.mean(torch.abs(self.percent - (u < 0).float()) * u ** 2)
+        self.rtg_optimizer.zero_grad()
+        rtg_loss.backward()
+        if self.grad_norm > 0:
+            rtg_grad_norms = nn.utils.clip_grad_norm_(self.rewardToGo.parameters(), max_norm=self.grad_norm, norm_type=2)
+        self.rtg_optimizer.step()
+
         '''Q Training'''
         current_q1, current_q2 = self.critic.forward(states, actions)
 
@@ -189,11 +212,10 @@ class Trainer:
 
         # rtg_preds, action_preds, state_preds, reward_preds
         with torch.no_grad():
-            next_rtg, _, _, _ = self.ema_model(
-                states, actions, rewards, action_target, rtg[:, :-1], timesteps, attention_mask=attention_mask,
-            )
-            for t in range(T - 2, -1, -1):
-                next_rtg[:, t, 0] = next_rtg[:, t+1, 0] + rewards[:, t, 0] / self.scale
+            next_rtg = self.rewardToGo(states, timesteps)
+            index_end = next_rtg.shape[1]
+            for t in range(index_end - 2, -1, -1):
+                next_rtg[:, t, :] = next_rtg[:, t + 1, :] + rewards[:, t, :] / self.scale
             _, next_action, _, _ = self.ema_model(
                 states, actions, rewards, action_target, next_rtg, timesteps, attention_mask=attention_mask,
             )
@@ -202,7 +224,6 @@ class Trainer:
             next_action = next_action[:, -1]
             target_q1, target_q2 = self.critic_target(critic_next_states, next_action)
             target_q = torch.min(target_q1, target_q2)  # [B, 1]
-
             q_target = torch.zeros_like(rewards) # [B, T, 1]
             not_done = (1 - dones[:, -1])  # [B, 1]
             q_target[:, -1] = not_done * target_q
@@ -231,22 +252,13 @@ class Trainer:
         action_preds_ = action_preds.reshape(-1, action_dim)[action_mask.reshape(-1)]
         action_target_ = action_target.reshape(-1, action_dim)[action_mask.reshape(-1)]
         bc_loss = F.mse_loss(action_preds_, action_target_)
-
-        # Rtg loss：期望回归
-        rtg_preds = rtg_preds.reshape(-1, 1)[attention_mask.reshape(-1) > 0]
-        rtg_target = rtg[:, :-1].reshape(-1, 1)[attention_mask.reshape(-1) > 0]
-        norm = rtg_target.abs().mean()
-        u = (rtg_target - rtg_preds) / norm
-        rtg_loss = torch.mean(torch.abs(self.percent - (u < 0).float()) * u ** 2)
-
         # q_action_loss
         actor_states = states.reshape(-1, state_dim)[action_mask]
-        q1_new_action, q2_new_action = self.critic(actor_states,  action_preds.reshape(-1, action_dim)[action_mask])
-        q_targets = self.critic.q_min(actor_states,  action_target.reshape(-1, action_dim)[action_mask]).detach().abs().mean()
+        q1_new_action, q2_new_action = self.critic(actor_states, action_preds.reshape(-1, action_dim)[action_mask])
+        q_targets = self.critic.q_min(actor_states, action_target.reshape(-1, action_dim)[action_mask]).detach().abs().mean()
         # 用最小q更新还是两个q都用于更新
         q_loss = -(q1_new_action.mean() / q_targets + q2_new_action.mean() / q_targets)
-
-        actor_loss = self.eta2 * bc_loss + self.eta * q_loss + rtg_loss
+        actor_loss = self.eta2 * bc_loss + self.eta * q_loss
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
