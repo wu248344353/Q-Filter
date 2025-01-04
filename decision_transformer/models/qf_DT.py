@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import transformers
 from decision_transformer.models.model import TrajectoryModel
 from decision_transformer.models.trajectory_gpt2 import GPT2Model
+from torch import distributions as pyd
 
 
 class Critic(nn.Module):
@@ -39,6 +40,40 @@ class Critic(nn.Module):
         return torch.min(q1, q2)
 
 
+class RewardToGo(nn.Module):
+    def __init__(self, state_dim, hidden_dim=256, max_ep_len=4096,):
+        super(RewardToGo, self).__init__()
+        self.embed_state = torch.nn.Linear(state_dim, hidden_dim)
+        self.embed_timestep = nn.Embedding(max_ep_len, hidden_dim)
+        self.rtg_model = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
+                                       nn.Mish(),
+                                       nn.Linear(hidden_dim, hidden_dim),
+                                       nn.Mish(),
+                                       nn.Linear(hidden_dim, hidden_dim),
+                                       nn.Mish(),
+                                       nn.Linear(hidden_dim, 1))
+
+    def forward(self, state, timesteps):
+        state_embeddings = self.embed_state(state)
+        time_embeddings = self.embed_timestep(timesteps)
+        x = torch.cat([state_embeddings + time_embeddings], dim=-1)
+        return self.rtg_model(x)
+
+
+class BaseActor(nn.Module):
+    def __init__(self, hidden_dim, act_dim):
+        super().__init__()
+        self.mu = torch.nn.Linear(hidden_dim, act_dim)
+        self.log_std = nn.Parameter(torch.zeros(act_dim, dtype=torch.float32))
+        self.log_std_min = -20
+        self.log_std_max = 2
+
+    def forward(self, obs):
+        mu = torch.tanh(self.mu(obs))
+        std = torch.exp(self.log_std.clamp(self.log_std_min, self.log_std_max))
+        return pyd.Normal(mu, std), mu
+
+
 class DecisionTransformer(TrajectoryModel):
 
     """
@@ -55,8 +90,6 @@ class DecisionTransformer(TrajectoryModel):
             action_tanh=True,
             sar=False,
             scale=1.,
-            rtg_no_q=False,
-            infer_no_q=False,
             **kwargs
     ):
         super().__init__(state_dim, act_dim, max_length=max_length)
@@ -71,8 +104,6 @@ class DecisionTransformer(TrajectoryModel):
         self.config = config
         self.sar = sar
         self.scale = scale
-        self.rtg_no_q = rtg_no_q
-        self.infer_no_q = infer_no_q
 
         # note: the only difference between this GPT2Model and the default Huggingface version
         # is that the positional embeddings are removed (since we'll add those ourselves)
@@ -88,11 +119,19 @@ class DecisionTransformer(TrajectoryModel):
 
         # note: we don't predict states or returns for the paper
         self.predict_state = torch.nn.Linear(hidden_size, self.state_dim)
-        self.predict_action = nn.Sequential(
-            *([nn.Linear(hidden_size, self.act_dim)] + ([nn.Tanh()] if action_tanh else []))
-        )
+        self.predict_action = BaseActor(hidden_size, self.act_dim)
+        # self.predict_action = nn.Sequential(
+        #     *([nn.Linear(hidden_size, self.act_dim)] + ([nn.Tanh()] if action_tanh else []))
+        # )
         self.predict_rewards = torch.nn.Linear(hidden_size, 1)
         self.predict_returns = torch.nn.Linear(hidden_size, 1)
+        # For entropy
+        self.log_temperature = torch.tensor(np.log(0.1))
+        self.log_temperature.requires_grad = True
+        self.target_entropy = -self.act_dim
+
+    def temperature(self):
+        return self.log_temperature.exp()
 
     def forward(self, states, actions, rewards=None, targets=None, returns_to_go=None, timesteps=None, attention_mask=None):
         batch_size, seq_length = states.shape[0], states.shape[1]
@@ -121,7 +160,7 @@ class DecisionTransformer(TrajectoryModel):
             ).permute(0, 2, 1, 3).reshape(batch_size, 3*seq_length, self.hidden_size)
         else:
             stacked_inputs = torch.stack(
-                (state_embeddings, returns_embeddings, action_embeddings), dim=1
+                (returns_embeddings, state_embeddings, action_embeddings), dim=1
             ).permute(0, 2, 1, 3).reshape(batch_size, 3*seq_length, self.hidden_size)
         stacked_inputs = self.embed_ln(stacked_inputs)
 
@@ -145,35 +184,21 @@ class DecisionTransformer(TrajectoryModel):
             rewards_preds = self.predict_rewards(x[:, 1])
             state_preds = self.predict_state(x[:, 2])
         else:
-            returns_preds = self.predict_returns(x[:, 0])
-            action_preds = self.predict_action(x[:, 1])
-            state_preds = self.predict_state(x[:, 2])
+            returns_preds = self.predict_returns(x[:, 2])
+            action_dis_preds, action_preds = self.predict_action(x[:, 1])
+            state_preds = self.predict_state(x[:, 0])
             rewards_preds = None
 
-        # return state_preds, action_preds, rewards_preds, returns_preds
-        return returns_preds, action_preds, state_preds, rewards_preds
+        return returns_preds, action_preds, state_preds, rewards_preds, action_dis_preds
 
-    def get_noise_action(self, critic, states, actions, rewards=None, returns_to_go=None, timesteps=None, repeat_num = 10, **kwargs):
+    def get_noise_action(self, critic, rewardToGo, states, actions, rewards=None, returns_to_go=None, timesteps=None, repeat_num = 10, **kwargs):
         states, actions, rewards, returns_to_go, timesteps, attention_mask = self.change_status(states, actions, rewards, returns_to_go, timesteps)
         with torch.no_grad():
-            rtg = torch.clone(returns_to_go)  # batch * context_len * 1
-            # 根据 return 和 reward更新 returns_to_go
-            # 从倒数第二个开始更新，最后一位是0
-            index_end = rtg.shape[1]
-            for i in range(index_end - 3, -1, -1):
-                rtg[0, i, 0] = rtg[0, i+1, 0] + rewards[0, i, 0] / self.scale
-
-            rtg_preds,  _, _, _ = self.forward(states, actions, rewards, None,
-                                               returns_to_go=rtg,
-                                               timesteps=timesteps,
-                                               attention_mask=attention_mask,
-                                               **kwargs)
-
-            rtg[:, -1] = rtg_preds[:, -1]
-
-            rtg_temp = torch.zeros_like(rtg, device=rtg.device, dtype=rtg.dtype)  # 1 * context_len * 1
-            rtg_temp[:, -1] = rtg_preds[:, -1]
-            rtg_temp_ = rtg_temp.repeat_interleave(repeats=repeat_num, dim=0)  # repeat_num * context_len * 1
+            rtg_preds = rewardToGo(states[:, -1], timesteps[:, -1])
+            index_end = returns_to_go.shape[1]
+            rtg_temp_ = torch.zeros_like(returns_to_go, device=returns_to_go.device, dtype=returns_to_go.dtype)  # 1 * context_len * 1
+            rtg_temp_[:, -1] = rtg_preds
+            rtg_temp_ = rtg_temp_.repeat_interleave(repeats=repeat_num, dim=0)  # repeat_num * context_len * 1
             noise = torch.cat([torch.zeros(1), torch.randn(repeat_num - 1) * 0.05], dim=0).to(rtg_temp_.device)
             rtg_temp_[:, -1, 0] = rtg_temp_[:, -1, 0] + noise
             for i in range(repeat_num):
@@ -184,7 +209,7 @@ class DecisionTransformer(TrajectoryModel):
             rewards_ = rewards.repeat_interleave(repeats=repeat_num, dim=0)
             timesteps_ = timesteps.repeat_interleave(repeats=repeat_num, dim=0)
             attention_mask_ = attention_mask.repeat_interleave(repeats=repeat_num, dim=0)
-            _, actions_preds, _, _ = self.forward(states_, actions_, rewards_, None,
+            _, actions_preds, _, _, action_dis_preds = self.forward(states_, actions_, rewards_, None,
                                                  returns_to_go=rtg_temp_,
                                                  timesteps=timesteps_,
                                                  attention_mask=attention_mask_,
@@ -194,35 +219,23 @@ class DecisionTransformer(TrajectoryModel):
             state_rpt = states_[:, -1, :]
             q_value = critic.q_min(state_rpt, actions_preds_).flatten()
             idx = torch.multinomial(F.softmax(q_value, dim=-1), 1)
-        return actions_preds_[idx, :], rtg_preds[0, -1, 0].item()
+        return actions_preds_[idx, :], rtg_preds[0, 0].item()
 
-    def get_rtg_action(self, critic, states, actions, rewards=None, returns_to_go=None, timesteps=None, **kwargs):
+    def get_rtg_action(self, critic, rewardToGo, states, actions, rewards=None, returns_to_go=None, timesteps=None, **kwargs):
         states, actions, rewards, returns_to_go, timesteps, attention_mask = self.change_status(states, actions, rewards, returns_to_go, timesteps)
         with torch.no_grad():
-            rtg = torch.clone(returns_to_go)  # batch * context_len * 1
-            # 根据 return 和 reward更新 returns_to_go
-            # 从倒数第二个开始更新，最后一位是0
-            index_end = rtg.shape[1]
-            for i in range(index_end - 3, -1, -1):
-                rtg[0, i, 0] = rtg[0, i+1, 0] + rewards[0, i, 0] / self.scale
-
-            rtg_preds,  _, _, _ = self.forward(states, actions, rewards, None,
-                                               returns_to_go=rtg,
-                                               timesteps=timesteps,
-                                               attention_mask=attention_mask,
-                                               **kwargs)
-
-            rtg[:, -1] = rtg_preds[:, -1]
-            rtg_temp = torch.zeros_like(rtg, device=rtg.device, dtype=rtg.dtype)  # 1 * context_len * 1
-            rtg_temp[:, -1] = rtg_preds[:, -1]
+            rtg_preds = rewardToGo(states[:, -1], timesteps[:, -1])
+            index_end = returns_to_go.shape[1]
+            rtg_temp = torch.zeros_like(returns_to_go, device=returns_to_go.device, dtype=returns_to_go.dtype)  # 1 * context_len * 1
+            rtg_temp[:, -1] = rtg_preds
             for t in range(index_end - 2, -1, -1):
-                rtg_temp[i, t, 0] = rtg_temp[i, t + 1, 0] + rewards[0, t, 0] / self.scale
+                rtg_temp[0, t, 0] = rtg_temp[0, t + 1, 0] + rewards[0, t, 0] / self.scale
             _, actions_preds, _, _ = self.forward(states, actions, rewards, None,
-                                                 returns_to_go=rtg_temp,
-                                                 timesteps=timesteps,
-                                                 attention_mask=attention_mask,
-                                                 **kwargs)
-        return actions_preds[0, -1, :], rtg_preds[0, -1, 0].item()
+                                                  returns_to_go=rtg_temp,
+                                                  timesteps=timesteps,
+                                                  attention_mask=attention_mask,
+                                                  **kwargs)
+        return actions_preds[0, -1, :], rtg_preds[0, 0].item()
 
     def change_status(self, states, actions, rewards=None, returns_to_go=None, timesteps=None):
         states = states.reshape(1, -1, self.state_dim)
