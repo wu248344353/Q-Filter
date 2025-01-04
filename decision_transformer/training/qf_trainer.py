@@ -33,6 +33,7 @@ class Trainer:
     def __init__(self,
                  model,
                  critic,
+                 rewardToGo,
                  batch_size,
                  tau,
                  discount,
@@ -61,6 +62,8 @@ class Trainer:
 
         self.actor = model
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr, weight_decay=weight_decay)
+        self.rewardToGo = rewardToGo
+        self.rtg_optimizer = torch.optim.Adam(self.rewardToGo.parameters(), lr=lr)
 
         self.step_start_ema = step_start_ema
         self.ema = EMA(ema_decay)
@@ -74,6 +77,7 @@ class Trainer:
         if lr_decay:
             self.actor_lr_scheduler = CosineAnnealingLR(self.actor_optimizer, T_max=lr_maxt, eta_min=lr_min)
             self.critic_lr_scheduler = CosineAnnealingLR(self.critic_optimizer, T_max=lr_maxt, eta_min=lr_min)
+            self.rewardToGo_lr_scheduler = CosineAnnealingLR(self.rtg_optimizer, T_max=lr_maxt, eta_min=lr_min)
 
         self.batch_size = batch_size
         self.get_batch = get_batch
@@ -96,6 +100,16 @@ class Trainer:
 
         self.start_time = time.time()
         self.step = 0
+        # self.train_a = True
+        self.max_length = self.actor.max_length
+
+        self.log_temperature_optimizer = torch.optim.Adam(
+            [self.actor.log_temperature],
+            lr=1e-4,
+            # 尝试增大lr，actor_loss能够稳定，但是性能并未提升
+            # lr=4e-3,
+            betas=[0.9, 0.999],
+        )
 
     def step_ema(self):
         if self.step > self.step_start_ema and self.step % self.update_ema_every == 0:
@@ -109,6 +123,7 @@ class Trainer:
 
         self.actor.train()
         self.critic.train()
+        self.rewardToGo.train()
         loss_metric = {
             'bc_loss': [],
             'ql_loss': [],
@@ -123,6 +138,8 @@ class Trainer:
         if self.lr_decay:
             self.actor_lr_scheduler.step()
             self.critic_lr_scheduler.step()
+            self.rewardToGo_lr_scheduler.step()
+            self.log_temperature_optimizer.step()
 
         logger.record_tabular('BC Loss', np.mean(loss_metric['bc_loss']))
         logger.record_tabular('QL Loss', np.mean(loss_metric['ql_loss']))
@@ -138,8 +155,9 @@ class Trainer:
 
         self.actor.eval()
         self.critic.eval()
+        self.rewardToGo.eval()
         for eval_fn in self.eval_fns:
-            outputs = eval_fn(self.actor, self.critic_target)
+            outputs = eval_fn(self.actor, self.critic_target, self.rewardToGo)
             for k, v in outputs.items():
                 logs[f'evaluation/{k}'] = v
 
@@ -182,84 +200,46 @@ class Trainer:
         action_dim = actions.shape[-1]
         device = states.device
 
+        '''RTG Training'''
+        rtg_predict = self.rewardToGo(states, timesteps)
+        rtg_preds = rtg_predict.reshape(-1, 1)[attention_mask.reshape(-1) > 0]
+        rtg_target = rtg[:, :-1].reshape(-1, 1)[attention_mask.reshape(-1) > 0]
+        # norm = rtg_target.abs().mean()
+        # u = (rtg_target - rtg_preds) / norm
+        u = rtg_target - rtg_preds
+        rtg_loss = torch.mean(torch.abs(self.percent - (u < 0).float()) * u ** 2)
+        self.rtg_optimizer.zero_grad()
+        rtg_loss.backward()
+        if self.grad_norm > 0:
+            rtg_grad_norms = nn.utils.clip_grad_norm_(self.rewardToGo.parameters(), max_norm=self.grad_norm, norm_type=2)
+        self.rtg_optimizer.step()
+
         '''Q Training'''
         current_q1, current_q2 = self.critic.forward(states, actions)
 
         T = current_q1.shape[1]
-        repeat_num = 10
 
-        if self.max_q_backup:
-            # 主要是为了给不同的rtg得到不同的action；
-            #  repeat_num个rtg得到repeat_num个action；
-            # 默认走False
-            states_rpt = torch.repeat_interleave(states, repeats=repeat_num, dim=0)
-            actions_rpt = torch.repeat_interleave(actions, repeats=repeat_num, dim=0)
-            rewards_rpt = torch.repeat_interleave(rewards, repeats=repeat_num, dim=0)
-            noise = torch.zeros(1, 1, 1)
-            noise = torch.cat([noise, torch.randn(repeat_num - 1, 1, 1)], dim=0).repeat(batch_size, 1, 1).to(
-                device)  # keep rtg logic
-            rtg_rpt = torch.repeat_interleave(rtg, repeats=repeat_num, dim=0)
-            rtg_rpt[:, -2:-1] = rtg_rpt[:, -2:-1] + noise * 0.1
-            timesteps_rpt = torch.repeat_interleave(timesteps, repeats=repeat_num, dim=0)
-            attention_mask_rpt = torch.repeat_interleave(attention_mask, repeats=repeat_num, dim=0)
-            with torch.no_grad():
-                _, next_action, _, _ = self.ema_model(
-                    states_rpt, actions_rpt, rewards_rpt, None, rtg_rpt[:, :-1], timesteps_rpt,
-                    attention_mask=attention_mask_rpt,
-                )
-        else:
-            # rtg_preds, action_preds, state_preds, reward_preds
-            with torch.no_grad():
-                _, next_action, _, _ = self.ema_model(
-                    states, actions, rewards, action_target, rtg[:, :-1], timesteps, attention_mask=attention_mask,
-                )
+        # rtg_preds, action_preds, state_preds, reward_preds
+        with torch.no_grad():
+            next_rtg = self.rewardToGo(states, timesteps)
+            index_end = next_rtg.shape[1]
+            for t in range(index_end - 2, -1, -1):
+                next_rtg[:, t, :] = next_rtg[:, t + 1, :] + rewards[:, t, :] / self.scale
+            _, next_action, _, _, next_action_dist = self.ema_model(
+                states, actions, rewards, action_target, next_rtg, timesteps, attention_mask=attention_mask,
+            )
 
-        if self.k_rewards:  # 默认为true
-            if self.max_q_backup:  # 默认False
-                critic_next_states = states_rpt[:, -1]
-                next_action = next_action[:, -1]
-                target_q1, target_q2 = self.critic_target(critic_next_states, next_action)
-                target_q1 = target_q1.view(batch_size, repeat_num).max(dim=1, keepdim=True)[0]
-                target_q2 = target_q2.view(batch_size, repeat_num).max(dim=1, keepdim=True)[0]
-            else:
-                critic_next_states = states[:, -1]
-                next_action = next_action[:, -1]
-                target_q1, target_q2 = self.critic_target(critic_next_states, next_action)
+            critic_next_states = states[:, -1]
+            next_action = next_action[:, -1]
+            target_q1, target_q2 = self.critic_target(critic_next_states, next_action)
             target_q = torch.min(target_q1, target_q2)  # [B, 1]
-
+            q_target = torch.zeros_like(rewards) # [B, T, 1]
             not_done = (1 - dones[:, -1])  # [B, 1]
-            if self.use_discount:  # 默认为true
-                rewards[:, -1] = 0.
-                mask_ = attention_mask.sum(dim=1).detach().cpu() # [B]
-                discount = [i - 1 - torch.arange(i) for i in mask_]
-                discount = torch.stack([torch.cat([i, torch.zeros(T - len(i))], dim=0) for i in discount], dim=0) # [B, T]
-                discount = (self.discount ** discount).unsqueeze(-1).to(device) # [B, T, 1]
-                k_rewards = torch.cumsum(rewards.flip(dims=[1]) * discount / self.reward_scale, dim=1).flip(dims=[1]) # [B, T, 1]
+            q_target[:, -1] = not_done * target_q
+            for t in range(T-2, -1, -1):
+                q_target[:, t] = rewards[:, t] / self.reward_scale + self.discount * q_target[:, t+1]
 
-                discount = [torch.arange(i) for i in mask_] # 
-                discount = torch.stack([torch.cat([torch.zeros(T - len(i)), i], dim=0) for i in discount], dim=0)
-                discount = (self.discount ** discount).unsqueeze(-1).to(device)
-                k_rewards = k_rewards / discount
-
-                discount = [i - 1 - torch.arange(i) for i in mask_]  # [B]
-                discount = torch.stack([torch.cat([torch.zeros(T - len(i)), i], dim=0) for i in discount], dim=0)
-                discount = (self.discount ** discount).to(device)  # [B, T]
-                target_q = (k_rewards + (not_done * discount * target_q).unsqueeze(-1)).detach()  # [B, T, 1]
-            else:  # 默认不会走这里
-                k_rewards = (rtg[:, :-1] - rtg[:, -2:-1]) * self.scale  # [B, T, 1]
-                target_q = (k_rewards + (not_done * target_q).unsqueeze(-1)).detach()  # [B, T, 1]
-        else:  # 默认不会走这里
-            if self.max_q_backup:
-                target_q1, target_q2 = self.critic_target(states_rpt, next_action)  # [B*repeat, T, 1]
-                target_q1 = target_q1.view(batch_size, repeat_num, T, 1).max(dim=1)[0]
-                target_q2 = target_q2.view(batch_size, repeat_num, T, 1).max(dim=1)[0]
-            else:
-                target_q1, target_q2 = self.critic_target(states, next_action)  # [B, T, 1]
-            target_q = torch.min(target_q1, target_q2)  # [B, T, 1]
-            target_q = rewards[:, :-1] + self.discount * target_q[:, 1:]
-            target_q = torch.cat([target_q, torch.zeros(batch_size, 1, 1).to(device)], dim=1)
-
-        critic_loss = F.mse_loss(current_q1[:, :-1][attention_mask[:, :-1]>0], target_q[:, :-1][attention_mask[:, :-1]>0].detach()) + F.mse_loss(current_q2[:, :-1][attention_mask[:, :-1]>0], target_q[:, :-1][attention_mask[:, :-1]>0].detach())
+        critic_loss = F.mse_loss(current_q1[:, :-1][attention_mask[:, :-1]>0], q_target[:, :-1][attention_mask[:, :-1]>0].detach()) + F.mse_loss(current_q2[:, :-1][attention_mask[:, :-1]>0], q_target[:, :-1][attention_mask[:, :-1]>0].detach())
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
@@ -269,7 +249,7 @@ class Trainer:
 
         '''Policy Training'''
         # state_preds, action_preds, reward_preds = self.actor.forward(
-        rtg_preds, action_preds, state_preds, reward_preds = self.actor.forward(
+        rtg_preds, action_preds, state_preds, reward_preds, action_dist_preds = self.actor.forward(
             states, actions, rewards, action_target, rtg[:, :-1], timesteps, attention_mask=attention_mask,
         )
 
@@ -278,36 +258,35 @@ class Trainer:
             q_target = self.critic.q_min(states[:, -1], action_target[:, -1]).detach()  # batch * 1 * 1
             q_percent = torch.quantile(q_target.reshape(-1), self.q_percent)
             action_mask = (attention_mask.reshape(-1) > 0) & (q_target.repeat(1, states.shape[1], 1).reshape(-1) > q_percent)
-        action_preds_ = action_preds.reshape(-1, action_dim)[action_mask.reshape(-1)]
-        action_target_ = action_target.reshape(-1, action_dim)[action_mask.reshape(-1)]
-        # action_preds_ = action_preds.reshape(-1, action_dim)[attention_mask.reshape(-1) > 0]
-        # action_target_ = action_target.reshape(-1, action_dim)[attention_mask.reshape(-1) > 0]
-        bc_loss = F.mse_loss(action_preds_, action_target_)
+        log_likelihood = action_dist_preds.log_prob(action_target).sum(axis=2)[action_mask.reshape(action_target.shape[0], action_target.shape[1])].mean()
+        # entropy = action_dist_preds.entropy().sum(axis=2)[action_mask.reshape(action_target.shape[0], action_target.shape[1])].mean()
+        # action_loss = -(log_likelihood + self.actor.temperature().detach() * entropy)
+        action_loss = -log_likelihood
+        bc_loss = action_loss
 
-        # Rtg loss：期望回归
-        rtg_preds = rtg_preds.reshape(-1, 1)[action_mask]
-        rtg_target = rtg[:, :-1].reshape(-1, 1)[action_mask]
-        norm = rtg_target.abs().mean()
-        u = (rtg_target - rtg_preds) / norm
-        rtg_loss = torch.mean(torch.abs(self.percent - (u < 0).float()) * u ** 2)
-        # rtg_loss = torch.mean(torch.where(u >= 0, self.tau * u, (self.tau-1) * u))
-
+        # action_preds_ = action_preds.reshape(-1, action_dim)[action_mask.reshape(-1)]
+        # action_target_ = action_target.reshape(-1, action_dim)[action_mask.reshape(-1)]
+        # bc_loss = F.mse_loss(action_preds_, action_target_)
         # q_action_loss
         actor_states = states.reshape(-1, state_dim)[action_mask]
-        q1_new_action, q2_new_action = self.critic(actor_states,  action_preds.reshape(-1, action_dim)[action_mask])
-        q_targets = self.critic.q_min(actor_states,  action_target.reshape(-1, action_dim)[action_mask]).detach().abs().mean()
-        """用最小q更新还是两个q都用于更新"""
-        # q_preds = torch.min(q1_new_action, q2_new_action)
-        # q_loss = -(q_preds.mean() / q_targets)
+        q1_new_action, q2_new_action = self.critic(actor_states, action_preds.reshape(-1, action_dim)[action_mask])
+        q_targets = self.critic.q_min(actor_states, action_target.reshape(-1, action_dim)[action_mask]).detach().abs().mean()
+        # 用最小q更新还是两个q都用于更新
         q_loss = -(q1_new_action.mean() / q_targets + q2_new_action.mean() / q_targets)
-
-        actor_loss = self.eta2 * bc_loss + self.eta * q_loss + rtg_loss
+        actor_loss = self.eta2 * bc_loss + self.eta * q_loss
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         if self.grad_norm > 0:
             actor_grad_norms = nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=self.grad_norm, norm_type=2)
         self.actor_optimizer.step()
+
+        # self.log_temperature_optimizer.zero_grad()
+        # temperature_loss = (
+        #         self.actor.temperature() * (entropy - self.actor.target_entropy).detach()
+        # )
+        # temperature_loss.backward()
+        # self.log_temperature_optimizer.step()
 
         """ Step Target network """
         self.step_ema()
@@ -318,7 +297,6 @@ class Trainer:
         self.step += 1
 
         with torch.no_grad():
-            # self.diagnostics['training/action_error'] = torch.mean((action_preds-action_target)**2).detach().cpu().item()
             self.diagnostics['training/action_error'] = bc_loss.item()
 
         if log_writer is not None:
