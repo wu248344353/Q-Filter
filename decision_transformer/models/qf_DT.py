@@ -39,6 +39,26 @@ class Critic(nn.Module):
         return torch.min(q1, q2)
 
 
+class RewardToGo(nn.Module):
+    def __init__(self, state_dim, hidden_dim=256, max_ep_len=4096,):
+        super(RewardToGo, self).__init__()
+        self.embed_state = torch.nn.Linear(state_dim, hidden_dim)
+        self.embed_timestep = nn.Embedding(max_ep_len, hidden_dim)
+        self.rtg_model = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
+                                       nn.Mish(),
+                                       nn.Linear(hidden_dim, hidden_dim),
+                                       nn.Mish(),
+                                       nn.Linear(hidden_dim, hidden_dim),
+                                       nn.Mish(),
+                                       nn.Linear(hidden_dim, 1))
+
+    def forward(self, state, timesteps):
+        state_embeddings = self.embed_state(state)
+        time_embeddings = self.embed_timestep(timesteps)
+        x = torch.cat([state_embeddings + time_embeddings], dim=-1)
+        return self.rtg_model(x)
+
+
 class DecisionTransformer(TrajectoryModel):
 
     """
@@ -55,8 +75,6 @@ class DecisionTransformer(TrajectoryModel):
             action_tanh=True,
             sar=False,
             scale=1.,
-            rtg_no_q=False,
-            infer_no_q=False,
             **kwargs
     ):
         super().__init__(state_dim, act_dim, max_length=max_length)
@@ -71,8 +89,6 @@ class DecisionTransformer(TrajectoryModel):
         self.config = config
         self.sar = sar
         self.scale = scale
-        self.rtg_no_q = rtg_no_q
-        self.infer_no_q = infer_no_q
 
         # note: the only difference between this GPT2Model and the default Huggingface version
         # is that the positional embeddings are removed (since we'll add those ourselves)
@@ -150,30 +166,16 @@ class DecisionTransformer(TrajectoryModel):
             state_preds = self.predict_state(x[:, 2])
             rewards_preds = None
 
-        # return state_preds, action_preds, rewards_preds, returns_preds
         return returns_preds, action_preds, state_preds, rewards_preds
 
-    def get_noise_action(self, critic, states, actions, rewards=None, returns_to_go=None, timesteps=None, repeat_num = 10, **kwargs):
+    def get_noise_action(self, critic, rewardToGo, states, actions, rewards=None, returns_to_go=None, timesteps=None, repeat_num = 10, **kwargs):
         states, actions, rewards, returns_to_go, timesteps, attention_mask = self.change_status(states, actions, rewards, returns_to_go, timesteps)
         with torch.no_grad():
-            rtg = torch.clone(returns_to_go)  # batch * context_len * 1
-            # 根据 return 和 reward更新 returns_to_go
-            # 从倒数第二个开始更新，最后一位是0
-            index_end = rtg.shape[1]
-            for i in range(index_end - 3, -1, -1):
-                rtg[0, i, 0] = rtg[0, i+1, 0] + rewards[0, i, 0] / self.scale
-
-            rtg_preds,  _, _, _ = self.forward(states, actions, rewards, None,
-                                               returns_to_go=rtg,
-                                               timesteps=timesteps,
-                                               attention_mask=attention_mask,
-                                               **kwargs)
-
-            rtg[:, -1] = rtg_preds[:, -1]
-
-            rtg_temp = torch.zeros_like(rtg, device=rtg.device, dtype=rtg.dtype)  # 1 * context_len * 1
-            rtg_temp[:, -1] = rtg_preds[:, -1]
-            rtg_temp_ = rtg_temp.repeat_interleave(repeats=repeat_num, dim=0)  # repeat_num * context_len * 1
+            rtg_preds = rewardToGo(states[:, -1], timesteps[:, -1])
+            index_end = returns_to_go.shape[1]
+            rtg_temp_ = torch.zeros_like(returns_to_go, device=returns_to_go.device, dtype=returns_to_go.dtype)  # 1 * context_len * 1
+            rtg_temp_[:, -1] = rtg_preds
+            rtg_temp_ = rtg_temp_.repeat_interleave(repeats=repeat_num, dim=0)  # repeat_num * context_len * 1
             noise = torch.cat([torch.zeros(1), torch.randn(repeat_num - 1) * 0.05], dim=0).to(rtg_temp_.device)
             rtg_temp_[:, -1, 0] = rtg_temp_[:, -1, 0] + noise
             for i in range(repeat_num):
@@ -194,35 +196,23 @@ class DecisionTransformer(TrajectoryModel):
             state_rpt = states_[:, -1, :]
             q_value = critic.q_min(state_rpt, actions_preds_).flatten()
             idx = torch.multinomial(F.softmax(q_value, dim=-1), 1)
-        return actions_preds_[idx, :], rtg_preds[0, -1, 0].item()
+        return actions_preds_[idx, :], rtg_preds[0, 0].item()
 
-    def get_rtg_action(self, critic, states, actions, rewards=None, returns_to_go=None, timesteps=None, **kwargs):
+    def get_rtg_action(self, critic, rewardToGo, states, actions, rewards=None, returns_to_go=None, timesteps=None, **kwargs):
         states, actions, rewards, returns_to_go, timesteps, attention_mask = self.change_status(states, actions, rewards, returns_to_go, timesteps)
         with torch.no_grad():
-            rtg = torch.clone(returns_to_go)  # batch * context_len * 1
-            # 根据 return 和 reward更新 returns_to_go
-            # 从倒数第二个开始更新，最后一位是0
-            index_end = rtg.shape[1]
-            for i in range(index_end - 3, -1, -1):
-                rtg[0, i, 0] = rtg[0, i+1, 0] + rewards[0, i, 0] / self.scale
-
-            rtg_preds,  _, _, _ = self.forward(states, actions, rewards, None,
-                                               returns_to_go=rtg,
-                                               timesteps=timesteps,
-                                               attention_mask=attention_mask,
-                                               **kwargs)
-
-            rtg[:, -1] = rtg_preds[:, -1]
-            rtg_temp = torch.zeros_like(rtg, device=rtg.device, dtype=rtg.dtype)  # 1 * context_len * 1
-            rtg_temp[:, -1] = rtg_preds[:, -1]
+            rtg_preds = rewardToGo(states[:, -1], timesteps[:, -1])
+            index_end = returns_to_go.shape[1]
+            rtg_temp = torch.zeros_like(returns_to_go, device=returns_to_go.device, dtype=returns_to_go.dtype)  # 1 * context_len * 1
+            rtg_temp[:, -1] = rtg_preds
             for t in range(index_end - 2, -1, -1):
-                rtg_temp[i, t, 0] = rtg_temp[i, t + 1, 0] + rewards[0, t, 0] / self.scale
+                rtg_temp[0, t, 0] = rtg_temp[0, t + 1, 0] + rewards[0, t, 0] / self.scale
             _, actions_preds, _, _ = self.forward(states, actions, rewards, None,
-                                                 returns_to_go=rtg_temp,
-                                                 timesteps=timesteps,
-                                                 attention_mask=attention_mask,
-                                                 **kwargs)
-        return actions_preds[0, -1, :], rtg_preds[0, -1, 0].item()
+                                                  returns_to_go=rtg_temp,
+                                                  timesteps=timesteps,
+                                                  attention_mask=attention_mask,
+                                                  **kwargs)
+        return actions_preds[0, -1, :], rtg_preds[0, 0].item()
 
     def change_status(self, states, actions, rewards=None, returns_to_go=None, timesteps=None):
         states = states.reshape(1, -1, self.state_dim)
