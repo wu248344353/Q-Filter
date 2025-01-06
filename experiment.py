@@ -15,7 +15,7 @@ import time
 
 from decision_transformer.evaluation.evaluate_episodes import evaluate_episode_rtg
 from decision_transformer.training.qf_trainer import Trainer
-from decision_transformer.models.qf_DT import DecisionTransformer, Critic
+from decision_transformer.models.qf_DT import DecisionTransformer, Critic, RewardToGo
 from logger import logger, setup_logger
 from torch.utils.tensorboard import SummaryWriter
 
@@ -264,8 +264,9 @@ def experiment(
                 d.append(traj['terminals'][si:si + max_len].reshape(1, -1, 1))
             else:
                 d.append(traj['dones'][si:si + max_len].reshape(1, -1, 1))
-
-            timesteps.append(np.arange(si, si + s[-1].shape[1]).reshape(1, -1))
+            # delta_steps = 0 if random.randint(0, 1) else max_ep_len - traj['rewards'].shape[0]
+            delta_steps = random.randint(0, max_ep_len - traj['rewards'].shape[0])
+            timesteps.append(np.arange(si + delta_steps, si + delta_steps + s[-1].shape[1]).reshape(1, -1))
             timesteps[-1][timesteps[-1] >= max_ep_len] = max_ep_len-1  # padding cutoff
 
             if variant['reward_tune'] == 'cql_antmaze':
@@ -319,7 +320,7 @@ def experiment(
         return s, a, r, target_a, d, rtg, timesteps, mask
 
     def eval_episodes(target_rew):
-        def fn(model, critic):
+        def fn(model, critic, rewardToGo):
             returns, lengths = [], []
             for _ in range(num_eval_episodes):
                 with torch.no_grad():
@@ -329,6 +330,7 @@ def experiment(
                         act_dim,
                         model,
                         critic,
+                        rewardToGo,
                         max_ep_len=max_ep_len,
                         scale=variant['test_scale'],
                         target_return=[t/variant['test_scale'] for t in target_rew],
@@ -364,20 +366,23 @@ def experiment(
         attn_pdrop=variant['dropout'],
         scale=scale,
         sar=variant['sar'],
-        rtg_no_q=variant['rtg_no_q'],
-        infer_no_q=variant['infer_no_q']
     )
     critic = Critic(
         state_dim, act_dim, hidden_dim=variant['embed_dim']
+    )
+    rewardToGo = RewardToGo(
+        state_dim, hidden_dim=variant['embed_dim'], max_ep_len=max_ep_len
     )
 
 
     model = model.to(device=device)
     critic = critic.to(device=device)
+    rewardToGo = rewardToGo.to(device=device)
 
     trainer = Trainer(
         model=model,
         critic=critic,
+        rewardToGo=rewardToGo,
         batch_size=batch_size,
         tau=variant['tau'],
         discount=variant['discount'],
@@ -409,14 +414,14 @@ def experiment(
     best_nor_ret = -1000
     best_iter = -1
     for iter in range(variant['max_iters']):
-        outputs = trainer.train_iteration(num_steps=variant['num_steps_per_iter'], logger=logger, 
-                    iter_num=iter+1, log_writer=writer)
+        outputs = trainer.train_iteration(num_steps=variant['num_steps_per_iter'],
+                                          logger=logger, iter_num=iter + 1, log_writer=writer)
         trainer.scale_up_eta(variant['lambda'])
         ret = outputs['Best_return_mean']
         nor_ret = outputs['Best_normalized_score']
         if ret > best_ret:
             state = {
-                'epoch': iter+1,
+                'epoch': iter + 1,
                 'actor': trainer.actor.state_dict(),
                 'critic': trainer.critic_target.state_dict(),
             }
@@ -477,8 +482,6 @@ if __name__ == '__main__':
     parser.add_argument("--scale", type=float, default=None)
     parser.add_argument("--reward_scale", type=float, default=1.0)
     parser.add_argument("--test_scale", type=float, default=None)
-    parser.add_argument("--rtg_no_q", action='store_true', default=False)
-    parser.add_argument("--infer_no_q", action='store_true', default=False)
     parser.add_argument("--noise_action", type=bool, default=True)
 
     args = parser.parse_args()
