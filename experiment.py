@@ -15,7 +15,7 @@ import time
 
 from decision_transformer.evaluation.evaluate_episodes import evaluate_episode_rtg
 from decision_transformer.training.qf_trainer import Trainer
-from decision_transformer.models.qf_DT import DecisionTransformer, Critic, RewardToGo
+from decision_transformer.models.qf_DT import DecisionTransformer, ReturnTransformer
 from logger import logger, setup_logger
 from torch.utils.tensorboard import SummaryWriter
 
@@ -40,6 +40,7 @@ class TrainerConfig:
         for k,v in kwargs.items():
             setattr(self, k, v)
 
+
 def save_checkpoint(state,name):
     filename =name
     torch.save(state, filename)
@@ -52,6 +53,7 @@ def discount_cumsum(x, gamma):
         discount_cumsum[t] = x[t] + gamma * discount_cumsum[t+1]
     return discount_cumsum
 
+
 def set_seed(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED']=str(seed)
@@ -60,6 +62,7 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
 
 def experiment(
         exp_prefix,
@@ -333,7 +336,7 @@ def experiment(
         return s, a, r, target_a, d, rtg, timesteps, mask
 
     def eval_episodes(target_rew):
-        def fn(model, critic, rewardToGo):
+        def fn(model, critic):
             returns, lengths = [], []
             for _ in range(num_eval_episodes):
                 with torch.no_grad():
@@ -343,7 +346,6 @@ def experiment(
                         act_dim,
                         model,
                         critic,
-                        rewardToGo,
                         max_ep_len=max_ep_len,
                         scale=variant['test_scale'],
                         target_return=[t/variant['test_scale'] for t in target_rew],
@@ -377,34 +379,46 @@ def experiment(
         n_positions=1024,
         resid_pdrop=variant['dropout'],
         attn_pdrop=variant['dropout'],
-        rtg_scale=2 * rtg_mult / (rtg_max - rtg_min),  # 使用reward计算rtg时需要用
-        # scale=scale,
-        # rtg_max=rtg_max,
-        # rtg_min=rtg_min,
-        sar=variant['sar'],
+        # rtg_scale=2 * rtg_mult / (rtg_max - rtg_min),  # 使用reward计算rtg时需要用
+        rtg_scale=2 / (rtg_max - rtg_min),  # 使用reward计算rtg时需要用
     )
-    critic = Critic(
-        state_dim, act_dim, hidden_dim=variant['embed_dim']
+    critic = ReturnTransformer(
+        state_dim=state_dim,
+        act_dim=act_dim,
+        max_length=K,
+        max_ep_len=max_ep_len,
+        hidden_size=variant['embed_dim'],
+        n_layer=variant['n_layer'],
+        n_head=variant['n_head'],
+        n_inner=4*variant['embed_dim'],
+        activation_function=variant['activation_function'],
+        n_positions=1024,
+        resid_pdrop=variant['dropout'],
+        attn_pdrop=variant['dropout'],
+        # rtg_scale=2 * rtg_mult / (rtg_max - rtg_min),  # 使用reward计算rtg时需要用
+        rtg_scale=2 / (rtg_max - rtg_min),  # 使用reward计算rtg时需要用
     )
-    rewardToGo = RewardToGo(
-        state_dim, hidden_dim=variant['embed_dim'], max_ep_len=max_ep_len, rtg_mult=rtg_mult
-    )
+    # critic = Critic(
+    #     state_dim, act_dim, hidden_dim=variant['embed_dim']
+    # )
+    # rewardToGo = RewardToGo(
+    #     state_dim, hidden_dim=variant['embed_dim'], max_ep_len=max_ep_len
+    # )
 
     model = model.to(device=device)
     critic = critic.to(device=device)
-    rewardToGo = rewardToGo.to(device=device)
+    # rewardToGo = rewardToGo.to(device=device)
+    # returnModel = returnModel.to(device=device)
 
     trainer = Trainer(
         model=model,
         critic=critic,
-        rewardToGo=rewardToGo,
         batch_size=batch_size,
         tau=variant['tau'],
         discount=variant['discount'],
         get_batch=get_batch,
         loss_fn=lambda s_hat, a_hat, r_hat, s, a, r: torch.mean((a_hat - a)**2),
         eval_fns=[eval_episodes(env_targets)],
-        max_q_backup=variant['max_q_backup'],
         eta=variant['eta'],
         eta2=variant['eta2'],
         ema_decay=0.995,
@@ -417,9 +431,6 @@ def experiment(
         lr_min=variant['lr_min'],
         grad_norm=variant['grad_norm'],
         rtg_scale=2 * 0.99 / (rtg_max - rtg_min),
-        # scale=scale,
-        # k_rewards=variant['k_rewards'],
-        # use_discount=variant['use_discount'],
         u_percent=variant['u_percent'],
         q_percent=variant['q_percent'],
         reward_scale=variant['reward_scale'],
