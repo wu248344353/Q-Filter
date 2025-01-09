@@ -40,8 +40,9 @@ class Critic(nn.Module):
 
 
 class RewardToGo(nn.Module):
-    def __init__(self, state_dim, hidden_dim=256, max_ep_len=4096,):
+    def __init__(self, state_dim, hidden_dim=256, max_ep_len=4096, rtg_mult=1):
         super(RewardToGo, self).__init__()
+        self.rtg_mult = rtg_mult
         self.embed_state = torch.nn.Linear(state_dim, hidden_dim)
         self.embed_timestep = nn.Embedding(max_ep_len, hidden_dim)
         self.rtg_model = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
@@ -50,13 +51,14 @@ class RewardToGo(nn.Module):
                                        nn.Mish(),
                                        nn.Linear(hidden_dim, hidden_dim),
                                        nn.Mish(),
-                                       nn.Linear(hidden_dim, 1))
+                                       nn.Linear(hidden_dim, 1),
+                                       nn.Tanh())
 
     def forward(self, state, timesteps):
         state_embeddings = self.embed_state(state)
         time_embeddings = self.embed_timestep(timesteps)
         x = torch.cat([state_embeddings + time_embeddings], dim=-1)
-        return self.rtg_model(x)
+        return self.rtg_model(x) * self.rtg_mult
 
 
 class DecisionTransformer(TrajectoryModel):
@@ -74,9 +76,10 @@ class DecisionTransformer(TrajectoryModel):
             max_ep_len=4096,
             action_tanh=True,
             sar=False,
-            scale=1.,
-            rtg_no_q=False,
-            infer_no_q=False,
+            rtg_scale=1,
+            # scale=1.,
+            # rtg_max=None,
+            # rtg_min=None,
             **kwargs
     ):
         super().__init__(state_dim, act_dim, max_length=max_length)
@@ -90,9 +93,10 @@ class DecisionTransformer(TrajectoryModel):
         )
         self.config = config
         self.sar = sar
-        self.scale = scale
-        self.rtg_no_q = rtg_no_q
-        self.infer_no_q = infer_no_q
+        # self.scale = scale
+        # self.rtg_max = rtg_max
+        # self.rtg_min = rtg_min
+        self.rtg_scale = rtg_scale
 
         # note: the only difference between this GPT2Model and the default Huggingface version
         # is that the positional embeddings are removed (since we'll add those ourselves)
@@ -124,7 +128,8 @@ class DecisionTransformer(TrajectoryModel):
         state_embeddings = self.embed_state(states)
         action_embeddings = self.embed_action(actions)
         returns_embeddings = self.embed_return(returns_to_go)
-        reward_embeddings = self.embed_rewards(rewards / self.scale)
+        # reward_embeddings = self.embed_rewards(rewards / self.scale)
+        reward_embeddings = self.embed_rewards(rewards)
         time_embeddings = self.embed_timestep(timesteps)
 
         # time embeddings are treated similar to positional embeddings
@@ -135,20 +140,23 @@ class DecisionTransformer(TrajectoryModel):
 
         # this makes the sequence look like (R_1, s_1, a_1, R_2, s_2, a_2, ...)
         # which works nice in an autoregressive sense since states predict actions
-        if self.sar:
-            stacked_inputs = torch.stack(
-                (state_embeddings, action_embeddings, reward_embeddings), dim=1
-            ).permute(0, 2, 1, 3).reshape(batch_size, 3*seq_length, self.hidden_size)
-        else:
-            stacked_inputs = torch.stack(
-                (state_embeddings, returns_embeddings, action_embeddings), dim=1
-            ).permute(0, 2, 1, 3).reshape(batch_size, 3*seq_length, self.hidden_size)
+        # if self.sar:
+        #     stacked_inputs = torch.stack(
+        #         (state_embeddings, action_embeddings, reward_embeddings), dim=1
+        #     ).permute(0, 2, 1, 3).reshape(batch_size, 3*seq_length, self.hidden_size)
+        # else:
+        #     stacked_inputs = torch.stack(
+        #         (state_embeddings, returns_embeddings, action_embeddings), dim=1
+        #     ).permute(0, 2, 1, 3).reshape(batch_size, 3*seq_length, self.hidden_size)
+        stacked_inputs = torch.stack(
+            (state_embeddings, returns_embeddings), dim=1
+        ).permute(0, 2, 1, 3).reshape(batch_size, 2*seq_length, self.hidden_size)
         stacked_inputs = self.embed_ln(stacked_inputs)
 
         # to make the attention mask fit the stacked inputs, have to stack it as well
         stacked_attention_mask = torch.stack(
-            (attention_mask, attention_mask, attention_mask), dim=1
-        ).permute(0, 2, 1).reshape(batch_size, 3*seq_length)
+            (attention_mask, attention_mask), dim=1
+        ).permute(0, 2, 1).reshape(batch_size, 2*seq_length)
 
         # we feed in the input embeddings (not word indices as in NLP) to the model
         transformer_outputs = self.transformer( inputs_embeds=stacked_inputs,
@@ -157,7 +165,7 @@ class DecisionTransformer(TrajectoryModel):
 
         # reshape x so that the second dimension corresponds to the original
         # returns (0), states (1), or actions (2); i.e. x[:,1,t] is the token for s_t
-        x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
+        x = x.reshape(batch_size, seq_length, 2, self.hidden_size).permute(0, 2, 1, 3)
 
         # get predictions
         if self.sar:
@@ -167,7 +175,7 @@ class DecisionTransformer(TrajectoryModel):
         else:
             returns_preds = self.predict_returns(x[:, 0])
             action_preds = self.predict_action(x[:, 1])
-            state_preds = self.predict_state(x[:, 2])
+            state_preds = None
             rewards_preds = None
 
         return returns_preds, action_preds, state_preds, rewards_preds
@@ -184,7 +192,9 @@ class DecisionTransformer(TrajectoryModel):
             rtg_temp_[:, -1, 0] = rtg_temp_[:, -1, 0] + noise
             for i in range(repeat_num):
                 for t in range(index_end - 2, -1, -1):
-                    rtg_temp_[i, t, 0] = rtg_temp_[i, t + 1, 0] + rewards[0, t, 0] / self.scale
+                    # rtg_temp_[i, t, 0] = rtg_temp_[i, t + 1, 0] + rewards[0, t, 0] / self.scale
+                    # rtg_temp_[i, t, 0] = rtg_temp_[i, t + 1, 0] + rewards[0, t, 0] / (self.rtg_max - self.rtg_min) * 2 * 0.99
+                    rtg_temp_[i, t, 0] = rtg_temp_[i, t + 1, 0] + rewards[0, t, 0] * self.rtg_scale
             states_ = states.repeat_interleave(repeats=repeat_num, dim=0)
             actions_ = actions.repeat_interleave(repeats=repeat_num, dim=0)
             rewards_ = rewards.repeat_interleave(repeats=repeat_num, dim=0)
@@ -210,7 +220,8 @@ class DecisionTransformer(TrajectoryModel):
             rtg_temp = torch.zeros_like(returns_to_go, device=returns_to_go.device, dtype=returns_to_go.dtype)  # 1 * context_len * 1
             rtg_temp[:, -1] = rtg_preds
             for t in range(index_end - 2, -1, -1):
-                rtg_temp[0, t, 0] = rtg_temp[0, t + 1, 0] + rewards[0, t, 0] / self.scale
+                # rtg_temp[0, t, 0] = rtg_temp[0, t + 1, 0] + rewards[0, t, 0] / self.scale
+                rtg_temp[0, t, 0] = rtg_temp[0, t + 1, 0] + rewards[0, t, 0] * self.rtg_scale
             _, actions_preds, _, _ = self.forward(states, actions, rewards, None,
                                                   returns_to_go=rtg_temp,
                                                   timesteps=timesteps,
