@@ -15,7 +15,7 @@ import time
 
 from decision_transformer.evaluation.evaluate_episodes import evaluate_episode_rtg
 from decision_transformer.training.qf_trainer import Trainer
-from decision_transformer.models.qf_DT import DecisionTransformer, ReturnTransformer
+from decision_transformer.models.qf_DT import DecisionTransformer, Critic, RewardToGo
 from logger import logger, setup_logger
 from torch.utils.tensorboard import SummaryWriter
 
@@ -205,7 +205,7 @@ def experiment(
         rtg_max = max(np.max(traj["returns_to_go"]), rtg_max)
         rtg_min = min(np.min(traj["returns_to_go"]), rtg_min)
     for traj in trajectories:
-        # [-1 , 1]
+        # -0.99>0.99
         traj["returns_to_go"] = ((traj["returns_to_go"] - rtg_min) * 2 / (rtg_max - rtg_min) - 1)
 
     # save all path information into separate lists
@@ -225,8 +225,8 @@ def experiment(
     state_mean, state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
     # rtg_mult = (np.abs(np.max(np.max((states - state_mean) / state_std, axis=0), axis=0)) + np.abs(np.min(np.min((states - state_mean) / state_std, axis=0), axis=0))) / 2
     # for traj in trajectories:
-    #     -rtg_mult > rtg_mult
-        # traj["returns_to_go"] = ((traj["returns_to_go"] - rtg_min) * 2 / (rtg_max - rtg_min) - 1) * rtg_mult
+    #     # -rtg_mult > rtg_mult
+    #     traj["returns_to_go"] = ((traj["returns_to_go"] - rtg_min) * 2 / (rtg_max - rtg_min) - 1) * rtg_mult
 
     num_timesteps = sum(traj_lens)
 
@@ -335,8 +335,8 @@ def experiment(
 
         return s, a, r, target_a, d, rtg, timesteps, mask
 
-    def eval_episodes(target_rew):
-        def fn(model, critic):
+    def eval_episodes():
+        def fn(model, critic, rewardToGo):
             returns, lengths = [], []
             for _ in range(num_eval_episodes):
                 with torch.no_grad():
@@ -346,9 +346,10 @@ def experiment(
                         act_dim,
                         model,
                         critic,
+                        rewardToGo,
                         max_ep_len=max_ep_len,
-                        scale=variant['test_scale'],
-                        target_return=[t/variant['test_scale'] for t in target_rew],
+                        # scale=variant['test_scale'],
+                        # target_return=[t/variant['test_scale'] for t in target_rew],
                         mode=mode,
                         state_mean=state_mean,
                         state_std=state_std,
@@ -358,11 +359,11 @@ def experiment(
                 returns.append(ret)
                 lengths.append(length)
             return {
-                f'target_{target_rew}_return_mean': np.mean(returns),
-                f'target_{target_rew}_return_std': np.std(returns),
-                f'target_{target_rew}_length_mean': np.mean(lengths),
-                f'target_{target_rew}_length_std': np.std(lengths),
-                f'target_{target_rew}_normalized_score': env.get_normalized_score(np.mean(returns)),
+                f'return_mean': np.mean(returns),
+                f'return_std': np.std(returns),
+                f'length_mean': np.mean(lengths),
+                f'length_std': np.std(lengths),
+                f'normalized_score': env.get_normalized_score(np.mean(returns)),
             }
         return fn
 
@@ -379,46 +380,34 @@ def experiment(
         n_positions=1024,
         resid_pdrop=variant['dropout'],
         attn_pdrop=variant['dropout'],
-        # rtg_scale=2 * rtg_mult / (rtg_max - rtg_min),  # 使用reward计算rtg时需要用
         rtg_scale=2 / (rtg_max - rtg_min),  # 使用reward计算rtg时需要用
+        # scale=scale,
+        # rtg_max=rtg_max,
+        # rtg_min=rtg_min,
+        # sar=variant['sar'],
     )
-    critic = ReturnTransformer(
-        state_dim=state_dim,
-        act_dim=act_dim,
-        max_length=K,
-        max_ep_len=max_ep_len,
-        hidden_size=variant['embed_dim'],
-        n_layer=variant['n_layer'],
-        n_head=variant['n_head'],
-        n_inner=4*variant['embed_dim'],
-        activation_function=variant['activation_function'],
-        n_positions=1024,
-        resid_pdrop=variant['dropout'],
-        attn_pdrop=variant['dropout'],
-        # rtg_scale=2 * rtg_mult / (rtg_max - rtg_min),  # 使用reward计算rtg时需要用
-        rtg_scale=2 / (rtg_max - rtg_min),  # 使用reward计算rtg时需要用
+    critic = Critic(
+        state_dim, act_dim, hidden_dim=variant['embed_dim']
     )
-    # critic = Critic(
-    #     state_dim, act_dim, hidden_dim=variant['embed_dim']
-    # )
-    # rewardToGo = RewardToGo(
-    #     state_dim, hidden_dim=variant['embed_dim'], max_ep_len=max_ep_len
-    # )
+    rewardToGo = RewardToGo(
+        state_dim, hidden_dim=variant['embed_dim'], max_ep_len=max_ep_len
+    )
 
     model = model.to(device=device)
     critic = critic.to(device=device)
-    # rewardToGo = rewardToGo.to(device=device)
-    # returnModel = returnModel.to(device=device)
+    rewardToGo = rewardToGo.to(device=device)
 
     trainer = Trainer(
         model=model,
         critic=critic,
+        rewardToGo=rewardToGo,
         batch_size=batch_size,
         tau=variant['tau'],
         discount=variant['discount'],
         get_batch=get_batch,
         loss_fn=lambda s_hat, a_hat, r_hat, s, a, r: torch.mean((a_hat - a)**2),
-        eval_fns=[eval_episodes(env_targets)],
+        eval_fns=[eval_episodes()],
+        # max_q_backup=variant['max_q_backup'],
         eta=variant['eta'],
         eta2=variant['eta2'],
         ema_decay=0.995,
@@ -430,7 +419,10 @@ def experiment(
         lr_maxt=variant['max_iters'],
         lr_min=variant['lr_min'],
         grad_norm=variant['grad_norm'],
-        rtg_scale=2 * 0.99 / (rtg_max - rtg_min),
+        rtg_scale=2 / (rtg_max - rtg_min),
+        # scale=scale,
+        # k_rewards=variant['k_rewards'],
+        use_discount=variant['use_discount'],
         u_percent=variant['u_percent'],
         q_percent=variant['q_percent'],
         reward_scale=variant['reward_scale'],
@@ -458,8 +450,8 @@ def experiment(
             best_iter = iter + 1
         logger.log(f'Current best return mean is {best_ret}, normalized score is {best_nor_ret*100}, Iteration {best_iter}')
         
-        # if variant['early_stop'] and iter >= variant['early_epoch']:
-        #     break
+        if variant['early_stop'] and iter >= variant['early_epoch']:
+            break
     logger.log(f'The final best return mean is {best_ret}')
     logger.log(f'The final best normalized return is {best_nor_ret * 100}')
 
@@ -471,8 +463,7 @@ if __name__ == '__main__':
     parser.add_argument('--env', type=str, default='hopper')
     parser.add_argument('--dataset', type=str, default='medium')  # medium, medium-replay, medium-expert, expert
     parser.add_argument('--mode', type=str, default='normal')  # normal for standard setting, delayed for sparse
-    # parser.add_argument('--K', type=int, default=20)
-    parser.add_argument('--K', type=int, default=10)
+    parser.add_argument('--K', type=int, default=20)
     parser.add_argument('--pct_traj', type=float, default=1.)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--embed_dim', type=int, default=256)
@@ -485,30 +476,26 @@ if __name__ == '__main__':
     parser.add_argument('--weight_decay', '-wd', type=float, default=1e-4)
     parser.add_argument('--warmup_steps', type=int, default=10000)
     parser.add_argument('--num_eval_episodes', type=int, default=10)
-    # parser.add_argument('--max_iters', type=int, default=500)
-    parser.add_argument('--max_iters', type=int, default=100)
-    # parser.add_argument('--num_steps_per_iter', type=int, default=1000)
+    parser.add_argument('--max_iters', type=int, default=500)
     parser.add_argument('--num_steps_per_iter', type=int, default=4000)
-    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--save_path', type=str, default='./save/')
 
     parser.add_argument("--discount", default=0.99, type=float)
     parser.add_argument("--u_percent", default=0.99, type=float)
-    parser.add_argument("--q_percent", default=0.0, type=float)
+    parser.add_argument("--q_percent", default=0.00, type=float)
     parser.add_argument("--tau", default=0.005, type=float)
     parser.add_argument("--eta", default=1.0, type=float)
     parser.add_argument("--eta2", default=1.0, type=float)
     parser.add_argument("--lambda", default=1.0, type=float)
-    parser.add_argument("--max_q_backup", action='store_true', default=False)
-    # parser.add_argument("--lr_decay", action='store_true', default=False)
+    # parser.add_argument("--max_q_backup", action='store_true', default=False)
     parser.add_argument("--lr_decay", action='store_true', default=True)
     parser.add_argument("--grad_norm", default=2.0, type=float)
-    # parser.add_argument("--early_stop", action='store_true', default=False)
-    # parser.add_argument("--early_stop", action='store_true', default=True)
+    parser.add_argument("--early_stop", action='store_true', default=False)
     parser.add_argument("--early_epoch", type=int, default=100)
     # parser.add_argument("--k_rewards", action='store_true', default=False)
-    # parser.add_argument("--use_discount", action='store_true', default=False)
-    parser.add_argument("--sar", action='store_true', default=False)
+    parser.add_argument("--use_discount", action='store_true', default=False)
+    # parser.add_argument("--sar", action='store_true', default=False)
     # parser.add_argument("--sar", action='store_true', default=True)
     parser.add_argument("--reward_tune", default='no', type=str)
     parser.add_argument("--scale", type=float, default=None)

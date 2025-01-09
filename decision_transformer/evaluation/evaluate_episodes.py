@@ -71,20 +71,23 @@ def evaluate_episode_rtg(
         act_dim,
         model,
         critic,
+        rewardToGo,
         max_ep_len=2000,
-        scale=1000.,
+        # scale=1000.,
         state_mean=0.,
         state_std=1.,
         device='cuda',
-        target_return=None,
+        # target_return=None,
         mode='normal',
         noise_action=True,
     ):
 
     model.eval()
     critic.eval()
+    rewardToGo.eval()
     model.to(device=device)
     critic.to(device=device)
+    rewardToGo.to(device=device)
 
     state_mean = torch.from_numpy(state_mean).to(device=device)
     state_std = torch.from_numpy(state_std).to(device=device)
@@ -110,6 +113,7 @@ def evaluate_episode_rtg(
                 action, return_preds = model.get_noise_action(
                     # action = model.get_action(
                     critic,
+                    rewardToGo,
                     (states.to(dtype=torch.float32) - state_mean) / state_std,
                     torch.cat(actions, dim=0).to(dtype=torch.float32),
                     torch.cat(rewards, dim=1).to(dtype=torch.float32),
@@ -121,6 +125,7 @@ def evaluate_episode_rtg(
                 action, return_preds = model.get_rtg_action(
                 # action = model.get_action(
                     critic,
+                    rewardToGo
                     (states.to(dtype=torch.float32) - state_mean) / state_std,
                     torch.cat(actions, dim=0).to(dtype=torch.float32),
                     torch.cat(rewards, dim=1).to(dtype=torch.float32),
@@ -134,10 +139,12 @@ def evaluate_episode_rtg(
             actions.insert(-1, torch.from_numpy(action).reshape(1, act_dim).to(device))
             rewards.insert(-1, torch.tensor(reward).reshape(1).unsqueeze(0).to(device))
             returns_to_go.insert(-1, torch.tensor(return_preds).reshape(1).unsqueeze(0).to(device))
+
             cur_state = torch.from_numpy(state).to(device=device).reshape(1, state_dim)
             states = torch.cat([states, cur_state], dim=0)
 
-            timesteps = torch.cat([timesteps,torch.ones((1, 1), device=device, dtype=torch.long) * (t+1)], dim=1)
+            timesteps = torch.cat([timesteps,torch.ones((1, 1), device=device,
+                                                        dtype=torch.long) * (t+1)], dim=1)
 
             episode_return += reward
             episode_length += 1
