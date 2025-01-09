@@ -52,9 +52,7 @@ class Trainer:
                  lr_maxt=100000,
                  lr_min=0.,
                  grad_norm=1.0,
-                 scale=1.0,
-                 k_rewards=True,
-                 use_discount=True,
+                 rtg_scale=1.0,
                  u_percent=0.99,
                  q_percent=0.05,
                  reward_scale=1.0,
@@ -91,9 +89,7 @@ class Trainer:
         self.eta = eta
         self.eta2 = eta2
         self.lr_decay = lr_decay
-        self.scale = scale
-        self.k_rewards = k_rewards
-        self.use_discount = use_discount
+        self.rtg_scale = rtg_scale
         self.percent = u_percent
         self.q_percent = q_percent
         self.reward_scale = reward_scale
@@ -148,7 +144,8 @@ class Trainer:
         self.critic.eval()
         self.rewardToGo.eval()
         for eval_fn in self.eval_fns:
-            outputs = eval_fn(self.actor, self.critic_target, self.rewardToGo)
+            # outputs = eval_fn(self.actor, self.critic_target, self.rewardToGo)
+            outputs = eval_fn(self.actor, self.critic, self.rewardToGo)
             for k, v in outputs.items():
                 logs[f'evaluation/{k}'] = v
 
@@ -215,22 +212,24 @@ class Trainer:
             next_rtg = self.rewardToGo(states, timesteps)
             index_end = next_rtg.shape[1]
             for t in range(index_end - 2, -1, -1):
-                next_rtg[:, t, :] = next_rtg[:, t + 1, :] + rewards[:, t, :] / self.scale
+                # next_rtg[:, t, :] = next_rtg[:, t + 1, :] + rewards[:, t, :] / self.scale
+                next_rtg[:, t, :] = next_rtg[:, t + 1, :] + rewards[:, t, :] * self.rtg_scale
             _, next_action, _, _ = self.ema_model(
                 states, actions, rewards, action_target, next_rtg, timesteps, attention_mask=attention_mask,
             )
 
             critic_next_states = states[:, -1]
-            next_action = next_action[:, -1]
-            target_q1, target_q2 = self.critic_target(critic_next_states, next_action)
+            critic_next_action = next_action[:, -1]
+            target_q1, target_q2 = self.critic_target(critic_next_states, critic_next_action)
             target_q = torch.min(target_q1, target_q2)  # [B, 1]
             q_target = torch.zeros_like(rewards) # [B, T, 1]
             not_done = (1 - dones[:, -1])  # [B, 1]
             q_target[:, -1] = not_done * target_q
             for t in range(T-2, -1, -1):
                 q_target[:, t] = rewards[:, t] / self.reward_scale + self.discount * q_target[:, t+1]
-
-        critic_loss = F.mse_loss(current_q1[:, :-1][attention_mask[:, :-1]>0], q_target[:, :-1][attention_mask[:, :-1]>0].detach()) + F.mse_loss(current_q2[:, :-1][attention_mask[:, :-1]>0], q_target[:, :-1][attention_mask[:, :-1]>0].detach())
+        critic_loss = F.mse_loss(current_q1[:, :-1][attention_mask[:, :-1] > 0],
+                                 q_target[:, :-1][attention_mask[:, :-1] > 0].detach()) + F.mse_loss(
+            current_q2[:, :-1][attention_mask[:, :-1] > 0], q_target[:, :-1][attention_mask[:, :-1] > 0].detach())
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
@@ -246,9 +245,12 @@ class Trainer:
 
         action_mask = (attention_mask.reshape(-1) > 0)
         if self.q_percent > 0.01:
-            q_target = self.critic.q_min(states[:, -1], action_target[:, -1]).detach()  # batch * 1 * 1
+            # 每个数据都不学还是某些动作不学
+            q_target = self.critic.q_min(states, action_target).detach()  # batch * 1 * 1
+            # q_target = self.critic.q_min(states[:, -1], action_target[:, -1]).detach()  # batch * 1 * 1
             q_percent = torch.quantile(q_target.reshape(-1), self.q_percent)
-            action_mask = (attention_mask.reshape(-1) > 0) & (q_target.repeat(1, states.shape[1], 1).reshape(-1) > q_percent)
+            action_mask = (attention_mask.reshape(-1) > 0) & (q_target.reshape(-1) > q_percent)
+            # action_mask = (attention_mask.reshape(-1) > 0) & (q_target.repeat(1, states.shape[1], 1).reshape(-1) > q_percent)
         action_preds_ = action_preds.reshape(-1, action_dim)[action_mask.reshape(-1)]
         action_target_ = action_target.reshape(-1, action_dim)[action_mask.reshape(-1)]
         bc_loss = F.mse_loss(action_preds_, action_target_)
