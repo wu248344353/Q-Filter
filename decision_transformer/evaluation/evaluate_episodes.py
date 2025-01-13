@@ -125,7 +125,7 @@ def evaluate_episode_rtg(
                 action, return_preds = model.get_rtg_action(
                 # action = model.get_action(
                     critic,
-                    rewardToGo
+                    rewardToGo,
                     (states.to(dtype=torch.float32) - state_mean) / state_std,
                     torch.cat(actions, dim=0).to(dtype=torch.float32),
                     torch.cat(rewards, dim=1).to(dtype=torch.float32),
